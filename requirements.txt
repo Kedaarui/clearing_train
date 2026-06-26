@@ -1,0 +1,60 @@
+# Core Dependencies
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Graph Processing
+networkx>=3.0
+
+# Optional: Graph Neural Networks (if using PyG)
+torch-geometric>=2.3.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.0
+
+# Data Processing
+scipy>=1.10.0
+tqdm>=4.65.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+
+# Configuration
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Logging
+loguru>=0.7.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# Code Quality
+black>=23.3.0
+flake8>=6.0.0
+mypy>=1.3.0
+
+# Jupyter (Optional)
+jupyter>=1.0.0
+ipykernel>=6.23.0
+ipywidgets>=8.0.0
+
+# Performance Monitoring
+psutil>=5.9.0
+memory-profiler>=0.61.0
+
+# Export &amp; Reporting
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+reportlab>=4.0.0
+
+Optional: Transformers (if using BERT for text)
+transformers>=4.30.0
+tokenizers>=0.13.0
+
+Optional: Hyperparameter Tuning
+optuna>=3.2.0
+ray[tune]>=2.5.0
