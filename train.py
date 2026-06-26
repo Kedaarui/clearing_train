@@ -132,98 +132,180 @@ class ClearingCompatibilityNet(nn.Module):
         
         return compatibility
 
-# ========== 3. 训练函数 ==========
-def train_compatibility_model(df_train, epochs=50, batch_size=128, lr=0.001):
+# ========== 3. 模型持久化 ==========
+def save_model(model, preprocessor, filepath='model.pt'):
+    torch.save({
+        'feature_dim': model.encoder[0].in_features,
+        'model_state_dict': model.state_dict(),
+        'label_encoders': preprocessor.label_encoders,
+        'scaler': preprocessor.scaler,
+    }, filepath)
+    print(f"模型已保存到 {filepath}")
+
+def load_model(model, preprocessor, filepath='model.pt'):
+    checkpoint = torch.load(filepath, map_location=device, weights_only=False)
+    preprocessor.label_encoders = checkpoint['label_encoders']
+    preprocessor.scaler = checkpoint['scaler']
+    feat_dim = checkpoint['feature_dim']
+    model = ClearingCompatibilityNet(feature_dim=feat_dim).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"模型已从 {filepath} 加载 (feature_dim={feat_dim})")
+    return model, preprocessor
+
+# ========== 4. 训练函数 ==========
+def train_compatibility_model(df_data, epochs=50, batch_size=128, lr=0.001, patience=10, val_ratio=0.15):
     """
-    训练兼容性模型
+    训练兼容性模型（含验证集 + early stopping）
     """
     print("=" * 70)
     print("训练兼容性模型")
     print("=" * 70)
     
-    # 预处理
     preprocessor = ClearingDataPreprocessor()
-    X, amounts, feature_names = preprocessor.preprocess(df_train, fit=True)
-    group_ids = df_train['Group ID'].values
+    X, amounts, _ = preprocessor.preprocess(df_data, fit=True)
+    group_ids = df_data['Group ID'].values
     
     print(f"\n特征维度: {X.shape[1]}")
     print(f"样本数: {len(X)}")
     print(f"组数: {len(np.unique(group_ids))}")
     
-    # 按组索引
-    groups = defaultdict(list)
-    for idx, gid in enumerate(group_ids):
-        groups[gid].append(idx)
+    # 按组划分 train / val
+    unique_groups_all = np.unique(group_ids)
+    train_groups, val_groups = train_test_split(unique_groups_all, test_size=val_ratio, random_state=42)
+    train_mask = np.isin(group_ids, train_groups)
     
-    group_list = list(groups.keys())
+    X_train = X[train_mask]
+    amounts_train = amounts[train_mask]
+    group_ids_train = group_ids[train_mask]
     
-    # 初始化模型
+    groups_train = defaultdict(list)
+    for idx, gid in enumerate(group_ids_train):
+        groups_train[gid].append(idx)
+    group_list_train = list(groups_train.keys())
+    
+    # 预采样验证 pair（固定，保证跨 epoch 可比）
+    val_pairs = []
+    val_groups_dict = defaultdict(list)
+    for gid in val_groups:
+        idxs = list(np.where(group_ids == gid)[0])
+        if len(idxs) >= 2:
+            val_groups_dict[gid] = idxs
+    val_group_list = list(val_groups_dict.keys())
+    
+    if val_group_list:
+        for _ in range(2000):
+            if np.random.rand() > 0.5 and len(val_group_list) > 0:
+                gid = np.random.choice(val_group_list)
+                i1, i2 = np.random.choice(val_groups_dict[gid], 2, replace=False)
+                val_pairs.append((i1, i2, 1.0))
+            else:
+                g1, g2 = np.random.choice(val_group_list, 2, replace=False)
+                i1 = np.random.choice(val_groups_dict[g1])
+                i2 = np.random.choice(val_groups_dict[g2])
+                val_pairs.append((i1, i2, 0.0))
+    else:
+        val_pairs = None
+    
     model = ClearingCompatibilityNet(feature_dim=X.shape[1]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     criterion = nn.BCELoss()
     
     print(f"\n模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"训练组数: {len(group_list_train)}, 验证组数: {len(val_group_list)}")
     
-    # 训练
+    best_val_loss = float('inf')
+    best_state = None
+    no_improve = 0
+    
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0
         epoch_acc = 0
         batch_count = 0
         
-        for _ in range(200):  # 每个 epoch 200 个 batch
-            # 采样正负样本对
+        for _ in range(200):
             batch_x1, batch_x2, batch_amt1, batch_amt2, batch_labels = [], [], [], [], []
             
             for _ in range(batch_size):
                 if np.random.rand() > 0.5:
-                    # 正样本：同组
-                    gid = np.random.choice(group_list)
-                    if len(groups[gid]) < 2:
+                    gid = np.random.choice(group_list_train)
+                    if len(groups_train[gid]) < 2:
                         continue
-                    idx1, idx2 = np.random.choice(groups[gid], 2, replace=False)
+                    idx1, idx2 = np.random.choice(groups_train[gid], 2, replace=False)
                     label = 1.0
                 else:
-                    # 负样本：不同组
-                    gid1, gid2 = np.random.choice(group_list, 2, replace=False)
-                    idx1 = np.random.choice(groups[gid1])
-                    idx2 = np.random.choice(groups[gid2])
+                    gid1, gid2 = np.random.choice(group_list_train, 2, replace=False)
+                    idx1 = np.random.choice(groups_train[gid1])
+                    idx2 = np.random.choice(groups_train[gid2])
                     label = 0.0
                 
-                batch_x1.append(X[idx1])
-                batch_x2.append(X[idx2])
-                batch_amt1.append(amounts[idx1])
-                batch_amt2.append(amounts[idx2])
+                batch_x1.append(X_train[idx1])
+                batch_x2.append(X_train[idx2])
+                batch_amt1.append(amounts_train[idx1])
+                batch_amt2.append(amounts_train[idx2])
                 batch_labels.append(label)
             
             if not batch_x1:
                 continue
             
-            # 转换为 tensor
             x1 = torch.FloatTensor(np.array(batch_x1)).to(device)
             x2 = torch.FloatTensor(np.array(batch_x2)).to(device)
             amt1 = torch.FloatTensor(batch_amt1).to(device)
             amt2 = torch.FloatTensor(batch_amt2).to(device)
             labels = torch.FloatTensor(batch_labels).unsqueeze(1).to(device)
             
-            # 前向传播
             preds = model(x1, x2, amt1, amt2)
             loss = criterion(preds, labels)
             
-            # 反向传播
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
-            # 统计
             epoch_loss += loss.item()
             epoch_acc += ((preds > 0.5).float() == labels).float().mean().item()
             batch_count += 1
         
+        # validation
+        val_loss = None
+        if val_pairs is not None:
+            model.eval()
+            with torch.no_grad():
+                v_x1 = torch.FloatTensor(np.array([X[p[0]] for p in val_pairs])).to(device)
+                v_x2 = torch.FloatTensor(np.array([X[p[1]] for p in val_pairs])).to(device)
+                v_amt1 = torch.FloatTensor([amounts[p[0]] for p in val_pairs]).to(device)
+                v_amt2 = torch.FloatTensor([amounts[p[1]] for p in val_pairs]).to(device)
+                v_labels = torch.FloatTensor([p[2] for p in val_pairs]).unsqueeze(1).to(device)
+                v_preds = model(v_x1, v_x2, v_amt1, v_amt2)
+                val_loss = criterion(v_preds, v_labels).item()
+        
         if epoch % 5 == 0:
-            avg_loss = epoch_loss / batch_count
-            avg_acc = epoch_acc / batch_count
-            print(f"Epoch {epoch:3d}: Loss = {avg_loss:.4f}, Acc = {avg_acc:.4f}")
+            msg = f"Epoch {epoch:3d}: train_loss={epoch_loss/batch_count:.4f}, train_acc={epoch_acc/batch_count:.4f}"
+            if val_loss is not None:
+                msg += f", val_loss={val_loss:.4f}"
+            print(msg)
+        
+        if val_loss is not None:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+        else:
+            if epoch_loss < best_val_loss:
+                best_val_loss = epoch_loss
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+        
+        if no_improve >= patience:
+            print(f"\nEarly stopping at epoch {epoch}")
+            break
+    
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.to(device)
     
     print("\n训练完成！")
     return model, preprocessor
@@ -231,84 +313,128 @@ def train_compatibility_model(df_train, epochs=50, batch_size=128, lr=0.001):
 # ========== 4. 推理：寻找清账组 ==========
 def find_clearing_groups(model, preprocessor, df_new, 
                         compatibility_threshold=0.6,
-                        max_group_size=10):
+                        max_group_size=10,
+                        block_size=256,
+                        pair_batch=8192):
     """
-    使用训练好的模型寻找清账组
+    按 Account 硬过滤后寻找清账组
     """
     print("\n" + "=" * 70)
     print("寻找清账组")
     print("=" * 70)
     
-    # 预处理
+    import networkx as nx
+    
     X, amounts, _ = preprocessor.preprocess(df_new, fit=False)
     n = len(X)
+    account_values = df_new['Account'].astype(str).values
     
-    print(f"\n处理 {n} 条凭证...")
+    # 按 Account 分组
+    account_to_indices = defaultdict(list)
+    for idx in range(n):
+        account_to_indices[account_values[idx]].append(idx)
+    print(f"\n处理 {n} 条凭证, {len(account_to_indices)} 个 Account 分组")
     
-    # 1. 批量计算兼容性并直接构建图（避免 O(n²) 矩阵）
-    print("计算兼容性并构建图...")
+    # 全局预计算 embeddings
+    print("预计算 embeddings...")
+    model.eval()
+    with torch.no_grad():
+        X_tensor = torch.FloatTensor(X).to(device)
+        all_embeds = model.encoder(X_tensor)
+        all_amt = torch.FloatTensor(amounts).to(device)
+    
+    all_clearing_groups = []
+    
+    for acc_idx, (account, indices_list) in enumerate(account_to_indices.items()):
+        indices = np.array(indices_list)
+        local_n = len(indices)
+        if local_n < 2:
+            continue
+        
+        # 当前 Account 组内构建图
+        G = _build_account_graph(
+            model, all_embeds, all_amt, indices,
+            compatibility_threshold, local_n, block_size, pair_batch
+        )
+        
+        # 连通分量 -> 零和子集
+        for component in nx.connected_components(G):
+            if len(component) < 2:
+                continue
+            local_comp = list(component)
+            global_comp = indices[local_comp]
+            clearing_subsets = find_zero_sum_subsets(global_comp, amounts, max_group_size)
+            all_clearing_groups.extend(clearing_subsets)
+        
+        if (acc_idx + 1) % 500 == 0:
+            print(f"  处理了 {acc_idx + 1}/{len(account_to_indices)} 个账户")
+    
+    print(f"\n找到 {len(all_clearing_groups)} 个清账组")
+    return all_clearing_groups
+
+
+def _build_account_graph(model, all_embeds, all_amt, indices,
+                         threshold, local_n, block_size, pair_batch):
+    """在单个 Account 组内构建兼容图"""
     import networkx as nx
     
     G = nx.Graph()
-    G.add_nodes_from(range(n))
-    edge_count = 0
+    G.add_nodes_from(range(local_n))
     
-    model.eval()
     with torch.no_grad():
-        batch_size = 1024
-        for i in range(0, n, batch_size):
-            end_i = min(i + batch_size, n)
-            for j in range(i + 1, n, batch_size):
-                end_j = min(j + batch_size, n)
+        for i in range(0, local_n, block_size):
+            end_i = min(i + block_size, local_n)
+            # 块内 pair（三角形）
+            if end_i - i >= 2:
+                inner_a, inner_b = np.meshgrid(
+                    np.arange(i, end_i), np.arange(i, end_i), indexing='ij')
+                inner_a = inner_a.flatten()
+                inner_b = inner_b.flatten()
+                keep = inner_a < inner_b
+                inner_a = inner_a[keep]
+                inner_b = inner_b[keep]
                 
-                pairs_i, pairs_j = np.meshgrid(
-                    np.arange(i, end_i),
-                    np.arange(j, end_j),
-                    indexing='ij'
-                )
-                pairs_i = pairs_i.flatten()
-                pairs_j = pairs_j.flatten()
+                for start in range(0, len(inner_a), pair_batch):
+                    end = min(start + pair_batch, len(inner_a))
+                    ga = indices[inner_a[start:end]]
+                    gb = indices[inner_b[start:end]]
+                    
+                    combined = torch.cat([
+                        all_embeds[torch.from_numpy(ga).to(all_embeds.device)],
+                        all_embeds[torch.from_numpy(gb).to(all_embeds.device)],
+                        (all_amt[torch.from_numpy(ga).to(all_amt.device)] + all_amt[torch.from_numpy(gb).to(all_amt.device)]).unsqueeze(1),
+                        torch.abs(all_amt[torch.from_numpy(ga).to(all_amt.device)] - all_amt[torch.from_numpy(gb).to(all_amt.device)]).unsqueeze(1),
+                    ], dim=1)
+                    
+                    compat = model.compatibility_net(combined).squeeze(-1).cpu().numpy()
+                    for k in np.where(compat > threshold)[0]:
+                        G.add_edge(inner_a[start+k], inner_b[start+k])
+            
+            # 跨块 pair
+            for j in range(end_i, local_n, block_size):
+                end_j = min(j + block_size, local_n)
+                ga, gb = np.meshgrid(
+                    np.arange(i, end_i), np.arange(j, end_j), indexing='ij')
+                ga = ga.flatten()
+                gb = gb.flatten()
                 
-                x1 = torch.FloatTensor(X[pairs_i]).to(device)
-                x2 = torch.FloatTensor(X[pairs_j]).to(device)
-                amt1 = torch.FloatTensor(amounts[pairs_i]).to(device)
-                amt2 = torch.FloatTensor(amounts[pairs_j]).to(device)
-
-                compat = model(x1, x2, amt1, amt2).squeeze().cpu().numpy()
-                
-                mask = compat > compatibility_threshold
-                for k in np.where(mask)[0]:
-                    G.add_edge(pairs_i[k], pairs_j[k], weight=float(compat[k]))
-                    edge_count += 1
+                for start in range(0, len(ga), pair_batch):
+                    end = min(start + pair_batch, len(ga))
+                    gag = indices[ga[start:end]]
+                    gbg = indices[gb[start:end]]
+                    
+                    combined = torch.cat([
+                        all_embeds[torch.from_numpy(gag).to(all_embeds.device)],
+                        all_embeds[torch.from_numpy(gbg).to(all_embeds.device)],
+                        (all_amt[torch.from_numpy(gag).to(all_amt.device)] + all_amt[torch.from_numpy(gbg).to(all_amt.device)]).unsqueeze(1),
+                        torch.abs(all_amt[torch.from_numpy(gag).to(all_amt.device)] - all_amt[torch.from_numpy(gbg).to(all_amt.device)]).unsqueeze(1),
+                    ], dim=1)
+                    
+                    compat = model.compatibility_net(combined).squeeze(-1).cpu().numpy()
+                    for k in np.where(compat > threshold)[0]:
+                        G.add_edge(ga[start+k], gb[start+k])
     
-    print(f"图中边数: {edge_count}")
-    
-    # 3. 在连通分量中寻找清账组
-    print("在连通分量中寻找清账组...")
-    all_clearing_groups = []
-    
-    connected_components = list(nx.connected_components(G))
-    print(f"连通分量数: {len(connected_components)}")
-    
-    for comp_idx, component in enumerate(connected_components):
-        component_list = list(component)
-        
-        if len(component_list) < 2:
-            continue
-        
-        # 在这个连通分量中寻找零和子集
-        clearing_subsets = find_zero_sum_subsets(
-            component_list, amounts, max_group_size
-        )
-        
-        all_clearing_groups.extend(clearing_subsets)
-        
-        if (comp_idx + 1) % 100 == 0:
-            print(f"  处理了 {comp_idx + 1}/{len(connected_components)} 个连通分量")
-    
-    print(f"\n找到 {len(all_clearing_groups)} 个清账组")
-    
-    return all_clearing_groups
+    return G
 
 def find_zero_sum_subsets(indices, amounts, max_group_size=10, tolerance=0.01):
     """
@@ -473,15 +599,15 @@ def evaluate_clearing_results(df_test, predicted_groups):
     }
 
 # ========== 6. 主流程 ==========
-def main(data_path='clearing_data.csv'):
+def main(data_path='clearing_data.csv', max_test_groups=None, model_path='model.pt'):
     """
     主流程
+    max_test_groups: 限制测试集组数用于快速验证（None=全部）
     """
     print("=" * 70)
     print("自动清账系统 - 深度学习方案")
     print("=" * 70)
     
-    # 加载数据
     print("\n加载数据...")
     df = pd.read_csv(data_path)
     
@@ -489,34 +615,41 @@ def main(data_path='clearing_data.csv'):
     print(f"唯一组数: {df['Group ID'].nunique()}")
     print(f"平均每组样本数: {len(df) / df['Group ID'].nunique():.2f}")
     
-    # 划分训练集和测试集（按组）
     print("\n划分训练集和测试集...")
     unique_groups = df['Group ID'].unique()
-    train_groups, test_groups = train_test_split(
+    train_groups_full, test_groups_full = train_test_split(
         unique_groups, test_size=0.2, random_state=42
     )
     
-    df_train = df[df['Group ID'].isin(train_groups)].reset_index(drop=True)
+    if max_test_groups is not None and max_test_groups < len(test_groups_full):
+        test_groups = np.random.RandomState(42).choice(test_groups_full, max_test_groups, replace=False)
+    else:
+        test_groups = test_groups_full
+    
+    df_data = df[df['Group ID'].isin(train_groups_full)].reset_index(drop=True)
     df_test = df[df['Group ID'].isin(test_groups)].reset_index(drop=True)
     
-    print(f"训练集: {len(df_train)} 行, {len(train_groups)} 组")
+    print(f"训练数据: {len(df_data)} 行, {len(train_groups_full)} 组")
     print(f"测试集: {len(df_test)} 行, {len(test_groups)} 组")
     
-    # 训练模型
-    model, preprocessor = train_compatibility_model(
-        df_train, 
-        epochs=50, 
-        batch_size=128, 
-        lr=0.001
-    )
+    # 训练（或加载已有模型）
+    import os
+    if os.path.exists(model_path):
+        print(f"\n发现已有模型 {model_path}，加载中...")
+        preprocessor = ClearingDataPreprocessor()
+        model, preprocessor = load_model(None, preprocessor, model_path)
+    else:
+        print("\n开始训练...")
+        model, preprocessor = train_compatibility_model(
+            df_data, epochs=50, batch_size=128, lr=0.001, patience=10
+        )
+        save_model(model, preprocessor, model_path)
     
     # 在测试集上预测
     df_test_no_label = df_test.drop('Group ID', axis=1)
     
     predicted_groups = find_clearing_groups(
-        model, 
-        preprocessor, 
-        df_test_no_label,
+        model, preprocessor, df_test_no_label,
         compatibility_threshold=0.6,
         max_group_size=10
     )
@@ -562,5 +695,7 @@ def main(data_path='clearing_data.csv'):
 
 # ========== 运行 ==========
 if __name__ == "__main__":
-    # 使用你的数据文件路径
-    model, preprocessor, predicted_groups, metrics = main('clearing_data.csv')
+    model, preprocessor, predicted_groups, metrics = main(
+        'clearing_data.csv',
+        max_test_groups=50  # 先用少量测试集快速验证，设为 None 跑全部
+    )
