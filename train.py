@@ -308,51 +308,135 @@ def find_clearing_groups(model, preprocessor, df_new, max_group_size=10, dbscan_
 # ========== 6. 零和子集搜索 ==========
 def find_zero_sum_subsets(indices, amounts, max_group_size=10, tolerance=0.01):
     n = len(indices)
-    if n > 25:
-        return greedy_zero_sum_search(indices, amounts, tolerance)
-    zero_sum_groups = []
-    for size in range(2, min(n + 1, max_group_size + 1)):
+    if n < 2:
+        return []
+
+    # Phase 1: hash-based pair matching (O(N), exact opposite amounts)
+    rounded = np.round(amounts[indices], 8)
+    amt_map = {}
+    for i, a in enumerate(rounded):
+        amt_map.setdefault(a, []).append(i)
+
+    pair_used = set()
+    groups = []
+    for i, a in enumerate(rounded):
+        if i in pair_used:
+            continue
+        neg = -a
+        if neg in amt_map:
+            for j in amt_map[neg]:
+                if j != i and j not in pair_used:
+                    groups.append([indices[i], indices[j]])
+                    pair_used.add(i)
+                    pair_used.add(j)
+                    break
+
+    # Phase 2: remaining items (use global amount dict for all sub-functions)
+    remaining = [indices[i] for i in range(n) if i not in pair_used]
+    if len(remaining) < 2:
+        return groups
+
+    rem_amts = amounts[remaining]
+    if abs(rem_amts.sum()) < tolerance:
+        groups.append(remaining)
+        return groups
+
+    if len(remaining) <= 20:
+        groups.extend(_enum(remaining, amounts, max_group_size, tolerance))
+    elif len(remaining) <= 100:
+        groups.extend(_smart_greedy(remaining, amounts, tolerance))
+    else:
+        groups.extend(_fast_greedy(remaining, amounts, tolerance))
+
+    return _dedup(groups)
+
+
+def _enum(indices, amounts, max_size, tol):
+    n = len(indices)
+    found = []
+    for size in range(2, min(n + 1, max_size + 1)):
         for combo in combinations(range(n), size):
-            subset = [indices[i] for i in combo]
-            if abs(amounts[subset].sum()) < tolerance:
-                zero_sum_groups.append(subset)
-    return select_non_overlapping_groups(zero_sum_groups)
+            sub = [indices[i] for i in combo]
+            if abs(amounts[sub].sum()) < tol:
+                found.append(sub)
+    return _dedup(found)
 
 
-def greedy_zero_sum_search(indices, amounts, tolerance=0.01):
-    clearing_groups = []
+def _smart_greedy(indices, amounts, tol, max_attempts=50):
+    groups = []
     used = set()
-    sorted_pairs = sorted([(i, amounts[i]) for i in indices], key=lambda x: abs(x[1]), reverse=True)
-    for anchor_idx, anchor_amt in sorted_pairs:
+    pairs = sorted([(i, amounts[i]) for i in indices], key=lambda x: abs(x[1]), reverse=True)
+
+    attempts = 0
+    for anchor_idx, anchor_amt in pairs:
+        if anchor_idx in used:
+            continue
+        if attempts >= max_attempts:
+            break
+        attempts += 1
+
+        group = [anchor_idx]
+        cur = anchor_amt
+        used.add(anchor_idx)
+
+        for _ in range(200):
+            best = None
+            best_dist = abs(cur)
+            for c_idx, c_amt in pairs:
+                if c_idx in used:
+                    continue
+                d = abs(cur + c_amt)
+                if d < best_dist - 1e-9:
+                    best_dist = d
+                    best = c_idx
+            if best is None or best_dist >= abs(cur):
+                break
+            group.append(best)
+            cur += amounts[best]
+            used.add(best)
+            if abs(cur) < tol:
+                break
+
+        if abs(cur) < tol and len(group) > 1:
+            groups.append(group)
+    return groups
+
+
+def _fast_greedy(indices, amounts, tol):
+    groups = []
+    used = set()
+    pairs = sorted([(i, amounts[i]) for i in indices], key=lambda x: abs(x[1]), reverse=True)
+
+    for anchor_idx, anchor_amt in pairs:
         if anchor_idx in used:
             continue
         group = [anchor_idx]
-        cur_sum = anchor_amt
+        cur = anchor_amt
         used.add(anchor_idx)
-        remaining = [(i, amounts[i]) for i in indices if i not in used]
-        for c_idx, c_amt in remaining:
-            new_sum = cur_sum + c_amt
-            if abs(new_sum) < abs(cur_sum):
+        for c_idx, _ in pairs:
+            if c_idx in used:
+                continue
+            if abs(cur + amounts[c_idx]) < abs(cur):
                 group.append(c_idx)
-                cur_sum = new_sum
+                cur += amounts[c_idx]
                 used.add(c_idx)
-                if abs(cur_sum) < tolerance:
+                if abs(cur) < tol:
                     break
-        if abs(cur_sum) < tolerance and len(group) > 1:
-            clearing_groups.append(group)
-    return clearing_groups
+        if abs(cur) < tol and len(group) > 1:
+            groups.append(group)
+    return groups
 
 
-def select_non_overlapping_groups(groups):
+def _dedup(groups):
     if not groups:
         return []
     groups = sorted(groups, key=len, reverse=True)
     selected = []
     used = set()
-    for group in groups:
-        if not any(idx in used for idx in group):
-            selected.append(group)
-            used.update(group)
+    for g in groups:
+        if not any(i in used for i in g):
+            selected.append(g)
+            used.update(g)
     return selected
 
 
@@ -460,7 +544,7 @@ def main(data_path='clearing_data.csv', max_test_groups=None, model_path='model.
 
     predicted_groups = find_clearing_groups(
         model, preprocessor, df_test_no_label,
-        max_group_size=10, dbscan_eps=0.3
+        max_group_size=10, dbscan_eps=0.01
     )
 
     metrics = evaluate_clearing_results(df_test, predicted_groups)
@@ -494,5 +578,5 @@ def main(data_path='clearing_data.csv', max_test_groups=None, model_path='model.
 if __name__ == "__main__":
     model, preprocessor, predicted_groups, metrics = main(
         'clearing_data.csv',
-        max_test_groups=50
+        max_test_groups=None
     )
