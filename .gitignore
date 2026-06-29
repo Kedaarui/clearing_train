@@ -3,3 +3,6 @@ backup/
 *Copy*
 *.xlsx
 :Zone.Identifier
+__pycache__/
+model.pt
+clearing_results.csv
