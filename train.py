@@ -3,699 +3,496 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.cluster import DBSCAN, OPTICS
 from collections import defaultdict
 from itertools import combinations
 import warnings
 warnings.filterwarnings('ignore')
 
-# 设备检测
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"使用设备: {device}")
 
-# ========== 1. 数据预处理 ==========
+# ========== 1. 数据预处理（Entity Embedding 支持） ==========
 class ClearingDataPreprocessor:
     def __init__(self):
-        self.label_encoders = {}
-        self.scaler = StandardScaler()
-        
+        self.vocabs = {}
+        self.cat_cols = ['Account', 'Profit Center', 'Trading partner', 'Supplier', 'Document currency', 'Text']
+        self._amt_mean = 0.0
+        self._amt_std = 1.0
+        self.cardinalities = {}
+
     def preprocess(self, df, fit=True):
-        """
-        预处理清账数据
-        """
         df = df.copy()
-        
-        # 填充缺失值
         df['Text'] = df['Text'].fillna('EMPTY')
         df['Trading partner'] = df['Trading partner'].fillna('0')
         df['Reference'] = df['Reference'].fillna('EMPTY')
         df['Assignment'] = df['Assignment'].fillna('EMPTY')
-        
-        # 选择关键特征
-        categorical_features = [
-            'Company Code',
-            'Account', 
-            'Profit Center',
-            'Trading partner',
-            'Supplier',
-            'Document currency',
-            'Text'
-        ]
-        
-        # 编码分类特征
-        encoded_features = []
-        
-        for col in categorical_features:
-            if fit:
-                le = LabelEncoder()
-                encoded = le.fit_transform(df[col].astype(str))
-                self.label_encoders[col] = le
-            else:
-                le = self.label_encoders.get(col)
-                if le is None:
-                    encoded = np.zeros(len(df))
-                else:
-                    encoded = df[col].astype(str).map(
-                        lambda x: le.transform([x])[0] if x in le.classes_ else -1
-                    )
-            
-            encoded_features.append(encoded)
-        
-        # 合并特征
-        X = np.column_stack(encoded_features)
-        
-        # 金额
-        amounts = df['Amount in doc. curr.'].values
-        
-        # 标准化特征（不包括金额）
-        if fit:
-            X_scaled = self.scaler.fit_transform(X)
-        else:
-            X_scaled = self.scaler.transform(X)
-        
-        return X_scaled, amounts, categorical_features
 
-# ========== 2. 深度学习模型 ==========
-class ClearingCompatibilityNet(nn.Module):
-    """
-    学习两个凭证是否"兼容"（可能在同一清账组）
-    
-    输入：两个凭证的特征
-    输出：兼容性得分 (0-1)
-    """
-    def __init__(self, feature_dim):
+        if fit:
+            for col in self.cat_cols:
+                values = df[col].astype(str).values
+                unique = sorted(set(v for v in values if pd.notna(v)))
+                self.vocabs[col] = {v: i + 1 for i, v in enumerate(unique)}
+                self.cardinalities[col] = len(unique) + 1
+            amt = df['Amount in doc. curr.'].values
+            self._amt_mean = float(amt.mean())
+            self._amt_std = float(amt.std())
+
+        cat_list = []
+        for col in self.cat_cols:
+            vocab = self.vocabs.get(col, {})
+            indices = df[col].astype(str).map(lambda x: vocab.get(x, 0)).values.astype(np.int64)
+            cat_list.append(indices)
+        cat_indices = np.column_stack(cat_list)
+
+        amounts = df['Amount in doc. curr.'].values.astype(np.float64)
+        amt_scaled = (amounts - self._amt_mean) / (self._amt_std + 1e-8)
+
+        return cat_indices, amounts, amt_scaled.astype(np.float32)
+
+
+# ========== 2. 模型（Entity Embedding + 投影） ==========
+class ClearingEncoder(nn.Module):
+    def __init__(self, cardinalities, embedding_dim=32):
         super().__init__()
-        
-        # 单个凭证的编码器
-        self.encoder = nn.Sequential(
-            nn.Linear(feature_dim, 64),
+        self.embeddings = nn.ModuleDict()
+        total_dim = 0
+        for col, n_cat in cardinalities.items():
+            dim = min(16, max(2, n_cat // 4)) if col == 'Text' else min(24, max(4, n_cat // 4))
+            self.embeddings[col] = nn.Embedding(n_cat, dim)
+            total_dim += dim
+        total_dim += 1
+
+        self.projection = nn.Sequential(
+            nn.Linear(total_dim, 64),
             nn.ReLU(),
             nn.BatchNorm1d(64),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.BatchNorm1d(32),
             nn.Dropout(0.2),
-            nn.Linear(32, 16)
+            nn.Linear(64, embedding_dim),
         )
-        
-        # 成对兼容性判断器
-        self.compatibility_net = nn.Sequential(
-            nn.Linear(16 * 2 + 2, 32),  # 两个编码 + 金额特征
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x1, x2, amt1, amt2):
-        """
-        x1, x2: 两个凭证的特征 [batch, feature_dim]
-        amt1, amt2: 两个凭证的金额 [batch, 1]
-        """
-        # 编码
-        emb1 = self.encoder(x1)
-        emb2 = self.encoder(x2)
-        
-        # 金额特征
-        amt_sum = (amt1 + amt2).unsqueeze(1)
-        amt_diff = torch.abs(amt1 - amt2).unsqueeze(1)
-        
-        # 拼接
-        combined = torch.cat([emb1, emb2, amt_sum, amt_diff], dim=1)
-        
-        # 兼容性得分
-        compatibility = self.compatibility_net(combined)
-        
-        return compatibility
+
+    def forward(self, cat_values, amt_scaled):
+        embs = [self.embeddings[col](cat_values[:, i]) for i, col in enumerate(self.embeddings)]
+        embs.append(amt_scaled.unsqueeze(1))
+        combined = torch.cat(embs, dim=1)
+        emb = self.projection(combined)
+        return F.normalize(emb, p=2, dim=1)
+
+
+def nt_xent_loss(embeddings, labels, temperature=0.5):
+    device = embeddings.device
+    n = embeddings.shape[0]
+    sim = embeddings @ embeddings.T / temperature
+    label_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
+    eye = torch.eye(n, dtype=torch.bool, device=device)
+    pos_mask = label_eq & ~eye
+    sim_exp = torch.exp(sim)
+    pos_sum = (sim_exp * pos_mask.float()).sum(dim=1)
+    all_sum = sim_exp.sum(dim=1) - sim_exp.diag()
+    loss = -torch.log((pos_sum + 1e-8) / (all_sum + 1e-8))
+    valid = pos_mask.sum(dim=1) > 0
+    return loss[valid].mean() if valid.any() else torch.tensor(0.0, device=device)
+
 
 # ========== 3. 模型持久化 ==========
 def save_model(model, preprocessor, filepath='model.pt'):
     torch.save({
-        'feature_dim': model.encoder[0].in_features,
+        'arch_version': 3,
         'model_state_dict': model.state_dict(),
-        'label_encoders': preprocessor.label_encoders,
-        'scaler': preprocessor.scaler,
+        'vocabs': preprocessor.vocabs,
+        'cardinalities': preprocessor.cardinalities,
+        'amt_mean': preprocessor._amt_mean,
+        'amt_std': preprocessor._amt_std,
     }, filepath)
     print(f"模型已保存到 {filepath}")
 
-def load_model(model, preprocessor, filepath='model.pt'):
+
+def load_model(filepath='model.pt'):
     checkpoint = torch.load(filepath, map_location=device, weights_only=False)
-    preprocessor.label_encoders = checkpoint['label_encoders']
-    preprocessor.scaler = checkpoint['scaler']
-    feat_dim = checkpoint['feature_dim']
-    model = ClearingCompatibilityNet(feature_dim=feat_dim).to(device)
+    preprocessor = ClearingDataPreprocessor()
+    preprocessor.vocabs = checkpoint['vocabs']
+    preprocessor.cardinalities = checkpoint['cardinalities']
+    preprocessor._amt_mean = checkpoint.get('amt_mean', 0.0)
+    preprocessor._amt_std = checkpoint.get('amt_std', 1.0)
+    model = ClearingEncoder(preprocessor.cardinalities).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"模型已从 {filepath} 加载 (feature_dim={feat_dim})")
+    print(f"模型已从 {filepath} 加载")
     return model, preprocessor
 
-# ========== 4. 训练函数 ==========
-def train_compatibility_model(df_data, epochs=50, batch_size=128, lr=0.001, patience=10, val_ratio=0.15):
-    """
-    训练兼容性模型（含验证集 + early stopping）
-    """
+
+# ========== 4. 训练（对比学习） ==========
+def train_encoder_model(df_data, epochs=50, batch_group_size=10, lr=0.001, patience=15, val_ratio=0.15):
     print("=" * 70)
-    print("训练兼容性模型")
+    print("训练编码器（对比学习 + Entity Embedding）")
     print("=" * 70)
-    
+
     preprocessor = ClearingDataPreprocessor()
-    X, amounts, _ = preprocessor.preprocess(df_data, fit=True)
+    cat_indices, amounts, amt_scaled = preprocessor.preprocess(df_data, fit=True)
     group_ids = df_data['Group ID'].values
-    
-    print(f"\n特征维度: {X.shape[1]}")
-    print(f"样本数: {len(X)}")
-    print(f"组数: {len(np.unique(group_ids))}")
-    
-    # 按组划分 train / val
+    accounts_full = df_data['Account'].astype(str).values
+
+    print(f"\n类别特征数: {len(preprocessor.cat_cols)}")
+    for col in preprocessor.cat_cols:
+        print(f"  {col}: {preprocessor.cardinalities[col]} 个唯一值")
+
     unique_groups_all = np.unique(group_ids)
     train_groups, val_groups = train_test_split(unique_groups_all, test_size=val_ratio, random_state=42)
     train_mask = np.isin(group_ids, train_groups)
-    
-    X_train = X[train_mask]
-    amounts_train = amounts[train_mask]
-    group_ids_train = group_ids[train_mask]
-    
+
+    cat_train = cat_indices[train_mask]
+    amt_train = amt_scaled[train_mask]
+    gid_train = group_ids[train_mask]
+    acct_train = accounts_full[train_mask]
+
     groups_train = defaultdict(list)
-    for idx, gid in enumerate(group_ids_train):
+    for idx, gid in enumerate(gid_train):
         groups_train[gid].append(idx)
     group_list_train = list(groups_train.keys())
-    
-    # 预采样验证 pair（固定，保证跨 epoch 可比）
-    val_pairs = []
-    val_groups_dict = defaultdict(list)
-    for gid in val_groups:
-        idxs = list(np.where(group_ids == gid)[0])
-        if len(idxs) >= 2:
-            val_groups_dict[gid] = idxs
-    val_group_list = list(val_groups_dict.keys())
-    
-    if val_group_list:
-        for _ in range(2000):
-            if np.random.rand() > 0.5 and len(val_group_list) > 0:
-                gid = np.random.choice(val_group_list)
-                i1, i2 = np.random.choice(val_groups_dict[gid], 2, replace=False)
-                val_pairs.append((i1, i2, 1.0))
-            else:
-                g1, g2 = np.random.choice(val_group_list, 2, replace=False)
-                i1 = np.random.choice(val_groups_dict[g1])
-                i2 = np.random.choice(val_groups_dict[g2])
-                val_pairs.append((i1, i2, 0.0))
-    else:
-        val_pairs = None
-    
-    model = ClearingCompatibilityNet(feature_dim=X.shape[1]).to(device)
+
+    account_to_groups = defaultdict(set)
+    for idx, gid in enumerate(gid_train):
+        account_to_groups[acct_train[idx]].add(gid)
+
+    model = ClearingEncoder(preprocessor.cardinalities).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    criterion = nn.BCELoss()
-    
+
     print(f"\n模型参数量: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"训练组数: {len(group_list_train)}, 验证组数: {len(val_group_list)}")
-    
+    print(f"训练组数: {len(group_list_train)}, 验证组数: {len(val_groups)}")
+
     best_val_loss = float('inf')
     best_state = None
     no_improve = 0
-    
+
     for epoch in range(epochs):
         model.train()
-        epoch_loss = 0
-        epoch_acc = 0
+        epoch_loss = 0.0
         batch_count = 0
-        
+
         for _ in range(200):
-            batch_x1, batch_x2, batch_amt1, batch_amt2, batch_labels = [], [], [], [], []
-            
-            for _ in range(batch_size):
-                if np.random.rand() > 0.5:
-                    gid = np.random.choice(group_list_train)
-                    if len(groups_train[gid]) < 2:
-                        continue
-                    idx1, idx2 = np.random.choice(groups_train[gid], 2, replace=False)
-                    label = 1.0
-                else:
-                    gid1, gid2 = np.random.choice(group_list_train, 2, replace=False)
-                    idx1 = np.random.choice(groups_train[gid1])
-                    idx2 = np.random.choice(groups_train[gid2])
-                    label = 0.0
-                
-                batch_x1.append(X_train[idx1])
-                batch_x2.append(X_train[idx2])
-                batch_amt1.append(amounts_train[idx1])
-                batch_amt2.append(amounts_train[idx2])
-                batch_labels.append(label)
-            
-            if not batch_x1:
+            n_groups = min(batch_group_size, len(group_list_train))
+            selected_gids = np.random.choice(group_list_train, n_groups, replace=False)
+
+            batch_indices = []
+            batch_gids = []
+
+            for gid in selected_gids:
+                members = groups_train[gid]
+                k = min(np.random.randint(2, 5), len(members))
+                idxs = np.random.choice(members, k, replace=False)
+                batch_indices.extend(idxs)
+                batch_gids.extend([gid] * k)
+
+            extra = []
+            for _ in range(n_groups // 2):
+                gid = np.random.choice(group_list_train)
+                acct = acct_train[np.random.choice(groups_train[gid])]
+                same_acct = [g for g in account_to_groups.get(acct, set()) if g != gid]
+                if same_acct:
+                    gid2 = np.random.choice(same_acct)
+                    extra.append(np.random.choice(groups_train[gid]))
+                    extra.append(np.random.choice(groups_train[gid2]))
+            if extra:
+                batch_indices.extend(extra)
+                batch_gids.extend([-1] * len(extra))
+
+            if len(batch_indices) < 4:
                 continue
-            
-            x1 = torch.FloatTensor(np.array(batch_x1)).to(device)
-            x2 = torch.FloatTensor(np.array(batch_x2)).to(device)
-            amt1 = torch.FloatTensor(batch_amt1).to(device)
-            amt2 = torch.FloatTensor(batch_amt2).to(device)
-            labels = torch.FloatTensor(batch_labels).unsqueeze(1).to(device)
-            
-            preds = model(x1, x2, amt1, amt2)
-            loss = criterion(preds, labels)
-            
+
+            x_cat = torch.LongTensor(cat_train[batch_indices]).to(device)
+            x_amt = torch.FloatTensor(amt_train[batch_indices]).to(device)
+
+            unique_batch = list(set(g for g in batch_gids if g != -1))
+            g2i = {g: i for i, g in enumerate(unique_batch)}
+            labels = torch.LongTensor([g2i.get(g, -1) for g in batch_gids]).to(device)
+
+            embeddings = model(x_cat, x_amt)
+            loss = nt_xent_loss(embeddings, labels, temperature=0.3)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+
             epoch_loss += loss.item()
-            epoch_acc += ((preds > 0.5).float() == labels).float().mean().item()
             batch_count += 1
-        
-        # validation
+
         val_loss = None
-        if val_pairs is not None:
+        if len(val_groups) >= 2:
             model.eval()
             with torch.no_grad():
-                v_x1 = torch.FloatTensor(np.array([X[p[0]] for p in val_pairs])).to(device)
-                v_x2 = torch.FloatTensor(np.array([X[p[1]] for p in val_pairs])).to(device)
-                v_amt1 = torch.FloatTensor([amounts[p[0]] for p in val_pairs]).to(device)
-                v_amt2 = torch.FloatTensor([amounts[p[1]] for p in val_pairs]).to(device)
-                v_labels = torch.FloatTensor([p[2] for p in val_pairs]).unsqueeze(1).to(device)
-                v_preds = model(v_x1, v_x2, v_amt1, v_amt2)
-                val_loss = criterion(v_preds, v_labels).item()
-        
+                v_idx, v_gid = [], []
+                for gid in val_groups:
+                    idxs = list(np.where(group_ids == gid)[0])
+                    if len(idxs) >= 2:
+                        v_idx.extend(idxs)
+                        v_gid.extend([gid] * len(idxs))
+                if len(v_idx) >= 4:
+                    uvg = list(set(v_gid))
+                    vg2i = {g: i for i, g in enumerate(uvg)}
+                    v_lab = torch.LongTensor([vg2i[g] for g in v_gid]).to(device)
+                    v_cat = torch.LongTensor(cat_indices[v_idx]).to(device)
+                    v_amt = torch.FloatTensor(amt_scaled[v_idx]).to(device)
+                    v_emb = model(v_cat, v_amt)
+                    val_loss = nt_xent_loss(v_emb, v_lab, temperature=0.3).item()
+
         if epoch % 5 == 0:
-            msg = f"Epoch {epoch:3d}: train_loss={epoch_loss/batch_count:.4f}, train_acc={epoch_acc/batch_count:.4f}"
+            msg = f"Epoch {epoch:3d}: train_loss={epoch_loss / max(batch_count, 1):.4f}"
             if val_loss is not None:
                 msg += f", val_loss={val_loss:.4f}"
             print(msg)
-        
-        if val_loss is not None:
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                no_improve = 0
-            else:
-                no_improve += 1
+
+        monitor = val_loss if val_loss is not None else epoch_loss / max(batch_count, 1)
+        if monitor < best_val_loss:
+            best_val_loss = monitor
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
         else:
-            if epoch_loss < best_val_loss:
-                best_val_loss = epoch_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                no_improve = 0
-            else:
-                no_improve += 1
-        
+            no_improve += 1
+
         if no_improve >= patience:
             print(f"\nEarly stopping at epoch {epoch}")
             break
-    
+
     if best_state is not None:
         model.load_state_dict(best_state)
     model.to(device)
-    
     print("\n训练完成！")
     return model, preprocessor
 
-# ========== 4. 推理：寻找清账组 ==========
-def find_clearing_groups(model, preprocessor, df_new, 
-                        compatibility_threshold=0.6,
-                        max_group_size=10,
-                        block_size=256,
-                        pair_batch=8192):
-    """
-    按 Account 硬过滤后寻找清账组
-    """
+
+# ========== 5. 推理（DBSCAN 聚类） ==========
+def find_clearing_groups(model, preprocessor, df_new, max_group_size=10, dbscan_eps=0.5):
     print("\n" + "=" * 70)
-    print("寻找清账组")
+    print("寻找清账组（DBSCAN 聚类）")
     print("=" * 70)
-    
-    import networkx as nx
-    
-    X, amounts, _ = preprocessor.preprocess(df_new, fit=False)
-    n = len(X)
+
+    cat_indices, amounts, amt_scaled = preprocessor.preprocess(df_new, fit=False)
+    n = len(cat_indices)
     account_values = df_new['Account'].astype(str).values
-    
-    # 按 Account 分组
+
     account_to_indices = defaultdict(list)
     for idx in range(n):
         account_to_indices[account_values[idx]].append(idx)
     print(f"\n处理 {n} 条凭证, {len(account_to_indices)} 个 Account 分组")
-    
-    # 全局预计算 embeddings
+
     print("预计算 embeddings...")
     model.eval()
     with torch.no_grad():
-        X_tensor = torch.FloatTensor(X).to(device)
-        all_embeds = model.encoder(X_tensor)
-        all_amt = torch.FloatTensor(amounts).to(device)
-    
+        x_cat = torch.LongTensor(cat_indices).to(device)
+        x_amt = torch.FloatTensor(amt_scaled).to(device)
+        embeddings = model(x_cat, x_amt).cpu().numpy()
+
     all_clearing_groups = []
-    
-    for acc_idx, (account, indices_list) in enumerate(account_to_indices.items()):
+
+    for account, indices_list in account_to_indices.items():
         indices = np.array(indices_list)
-        local_n = len(indices)
-        if local_n < 2:
+        if len(indices) < 2:
             continue
-        
-        # 当前 Account 组内构建图
-        G = _build_account_graph(
-            model, all_embeds, all_amt, indices,
-            compatibility_threshold, local_n, block_size, pair_batch
-        )
-        
-        # 连通分量 -> 零和子集
-        for component in nx.connected_components(G):
-            if len(component) < 2:
+        local_embeds = embeddings[indices]
+
+        clustering = DBSCAN(eps=dbscan_eps, min_samples=2, metric='cosine').fit(local_embeds)
+
+        for cluster_id in set(clustering.labels_):
+            if cluster_id < 0:
                 continue
-            local_comp = list(component)
-            global_comp = indices[local_comp]
-            clearing_subsets = find_zero_sum_subsets(global_comp, amounts, max_group_size)
-            all_clearing_groups.extend(clearing_subsets)
-        
-        if (acc_idx + 1) % 500 == 0:
-            print(f"  处理了 {acc_idx + 1}/{len(account_to_indices)} 个账户")
-    
+            cluster_global = indices[clustering.labels_ == cluster_id]
+            if len(cluster_global) < 2:
+                continue
+            subsets = find_zero_sum_subsets(cluster_global, amounts, max_group_size)
+            all_clearing_groups.extend(subsets)
+
     print(f"\n找到 {len(all_clearing_groups)} 个清账组")
     return all_clearing_groups
 
 
-def _build_account_graph(model, all_embeds, all_amt, indices,
-                         threshold, local_n, block_size, pair_batch):
-    """在单个 Account 组内构建兼容图"""
-    import networkx as nx
-    
-    G = nx.Graph()
-    G.add_nodes_from(range(local_n))
-    
-    with torch.no_grad():
-        for i in range(0, local_n, block_size):
-            end_i = min(i + block_size, local_n)
-            # 块内 pair（三角形）
-            if end_i - i >= 2:
-                inner_a, inner_b = np.meshgrid(
-                    np.arange(i, end_i), np.arange(i, end_i), indexing='ij')
-                inner_a = inner_a.flatten()
-                inner_b = inner_b.flatten()
-                keep = inner_a < inner_b
-                inner_a = inner_a[keep]
-                inner_b = inner_b[keep]
-                
-                for start in range(0, len(inner_a), pair_batch):
-                    end = min(start + pair_batch, len(inner_a))
-                    ga = indices[inner_a[start:end]]
-                    gb = indices[inner_b[start:end]]
-                    
-                    combined = torch.cat([
-                        all_embeds[torch.from_numpy(ga).to(all_embeds.device)],
-                        all_embeds[torch.from_numpy(gb).to(all_embeds.device)],
-                        (all_amt[torch.from_numpy(ga).to(all_amt.device)] + all_amt[torch.from_numpy(gb).to(all_amt.device)]).unsqueeze(1),
-                        torch.abs(all_amt[torch.from_numpy(ga).to(all_amt.device)] - all_amt[torch.from_numpy(gb).to(all_amt.device)]).unsqueeze(1),
-                    ], dim=1)
-                    
-                    compat = model.compatibility_net(combined).squeeze(-1).cpu().numpy()
-                    for k in np.where(compat > threshold)[0]:
-                        G.add_edge(inner_a[start+k], inner_b[start+k])
-            
-            # 跨块 pair
-            for j in range(end_i, local_n, block_size):
-                end_j = min(j + block_size, local_n)
-                ga, gb = np.meshgrid(
-                    np.arange(i, end_i), np.arange(j, end_j), indexing='ij')
-                ga = ga.flatten()
-                gb = gb.flatten()
-                
-                for start in range(0, len(ga), pair_batch):
-                    end = min(start + pair_batch, len(ga))
-                    gag = indices[ga[start:end]]
-                    gbg = indices[gb[start:end]]
-                    
-                    combined = torch.cat([
-                        all_embeds[torch.from_numpy(gag).to(all_embeds.device)],
-                        all_embeds[torch.from_numpy(gbg).to(all_embeds.device)],
-                        (all_amt[torch.from_numpy(gag).to(all_amt.device)] + all_amt[torch.from_numpy(gbg).to(all_amt.device)]).unsqueeze(1),
-                        torch.abs(all_amt[torch.from_numpy(gag).to(all_amt.device)] - all_amt[torch.from_numpy(gbg).to(all_amt.device)]).unsqueeze(1),
-                    ], dim=1)
-                    
-                    compat = model.compatibility_net(combined).squeeze(-1).cpu().numpy()
-                    for k in np.where(compat > threshold)[0]:
-                        G.add_edge(ga[start+k], gb[start+k])
-    
-    return G
-
+# ========== 6. 零和子集搜索 ==========
 def find_zero_sum_subsets(indices, amounts, max_group_size=10, tolerance=0.01):
-    """
-    在给定索引中寻找金额和为 0 的子集
-    """
     n = len(indices)
-    zero_sum_groups = []
-    
     if n > 25:
-        # 使用贪心算法
         return greedy_zero_sum_search(indices, amounts, tolerance)
-    
-    # 枚举所有可能的子集
+    zero_sum_groups = []
     for size in range(2, min(n + 1, max_group_size + 1)):
         for combo in combinations(range(n), size):
-            subset_indices = [indices[i] for i in combo]
-            subset_amounts = amounts[subset_indices]
-            
-            if abs(subset_amounts.sum()) < tolerance:
-                zero_sum_groups.append(subset_indices)
-    
-    # 选择不重叠的组
+            subset = [indices[i] for i in combo]
+            if abs(amounts[subset].sum()) < tolerance:
+                zero_sum_groups.append(subset)
     return select_non_overlapping_groups(zero_sum_groups)
 
+
 def greedy_zero_sum_search(indices, amounts, tolerance=0.01):
-    """
-    贪心搜索零和组
-    """
     clearing_groups = []
     used = set()
-    
-    # 按金额绝对值排序
-    sorted_pairs = sorted(
-        [(i, amounts[i]) for i in indices], 
-        key=lambda x: abs(x[1]), 
-        reverse=True
-    )
-    
+    sorted_pairs = sorted([(i, amounts[i]) for i in indices], key=lambda x: abs(x[1]), reverse=True)
     for anchor_idx, anchor_amt in sorted_pairs:
         if anchor_idx in used:
             continue
-        
-        current_group = [anchor_idx]
-        current_sum = anchor_amt
+        group = [anchor_idx]
+        cur_sum = anchor_amt
         used.add(anchor_idx)
-        
-        # 贪心添加其他凭证
         remaining = [(i, amounts[i]) for i in indices if i not in used]
-        
-        for candidate_idx, candidate_amt in remaining:
-            new_sum = current_sum + candidate_amt
-            
-            # 如果更接近 0，添加
-            if abs(new_sum) < abs(current_sum):
-                current_group.append(candidate_idx)
-                current_sum = new_sum
-                used.add(candidate_idx)
-                
-                if abs(current_sum) < tolerance:
+        for c_idx, c_amt in remaining:
+            new_sum = cur_sum + c_amt
+            if abs(new_sum) < abs(cur_sum):
+                group.append(c_idx)
+                cur_sum = new_sum
+                used.add(c_idx)
+                if abs(cur_sum) < tolerance:
                     break
-        
-        # 保存组
-        if abs(current_sum) < tolerance and len(current_group) > 1:
-            clearing_groups.append(current_group)
-    
+        if abs(cur_sum) < tolerance and len(group) > 1:
+            clearing_groups.append(group)
     return clearing_groups
 
+
 def select_non_overlapping_groups(groups):
-    """
-    选择不重叠的组（优先选择大组）
-    """
     if not groups:
         return []
-    
     groups = sorted(groups, key=len, reverse=True)
-    
     selected = []
     used = set()
-    
     for group in groups:
         if not any(idx in used for idx in group):
             selected.append(group)
             used.update(group)
-    
     return selected
 
-# ========== 5. 评估 ==========
+
+# ========== 7. 评估 ==========
 def evaluate_clearing_results(df_test, predicted_groups):
-    """
-    评估清账结果
-    """
     print("\n" + "=" * 70)
     print("评估结果")
     print("=" * 70)
-    
+
     n_total = len(df_test)
-    
-    # 1. 覆盖率
     covered_indices = set()
     for group in predicted_groups:
         covered_indices.update(group)
     coverage = len(covered_indices) / n_total
-    
-    # 2. 零和准确率
+
     zero_sum_count = 0
-    total_deviation = 0
-    
+    total_deviation = 0.0
     for group in predicted_groups:
         group_sum = df_test.iloc[group]['Amount in doc. curr.'].sum()
         total_deviation += abs(group_sum)
-        
         if abs(group_sum) < 0.01:
             zero_sum_count += 1
-    
-    zero_sum_accuracy = zero_sum_count / len(predicted_groups) if predicted_groups else 0
-    avg_deviation = total_deviation / len(predicted_groups) if predicted_groups else 0
-    
-    # 3. 组大小统计
+
+    zsa = zero_sum_count / len(predicted_groups) if predicted_groups else 0
+    avg_dev = total_deviation / len(predicted_groups) if predicted_groups else 0
     group_sizes = [len(g) for g in predicted_groups]
-    avg_group_size = np.mean(group_sizes) if group_sizes else 0
-    
-    # 4. 与真实标签对比（如果有）
+    avg_gs = np.mean(group_sizes) if group_sizes else 0
+
     if 'Group ID' in df_test.columns:
         from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-        
-        # 转换为标签
         pred_labels = np.full(n_total, -1)
         true_labels = df_test['Group ID'].values
-        
         for i, group in enumerate(predicted_groups):
             for idx in group:
                 pred_labels[idx] = i
-        
         ari = adjusted_rand_score(true_labels, pred_labels)
         nmi = normalized_mutual_info_score(true_labels, pred_labels)
     else:
-        ari = None
-        nmi = None
-    
-    # 打印结果
+        ari = nmi = None
+
     print(f"\n覆盖率: {coverage:.2%} ({len(covered_indices)}/{n_total})")
-    print(f"零和准确率: {zero_sum_accuracy:.2%} ({zero_sum_count}/{len(predicted_groups)})")
-    print(f"平均偏差: {avg_deviation:.4f}")
+    print(f"零和准确率: {zsa:.2%} ({zero_sum_count}/{len(predicted_groups)})")
+    print(f"平均偏差: {avg_dev:.4f}")
     print(f"预测组数: {len(predicted_groups)}")
-    print(f"平均组大小: {avg_group_size:.2f}")
+    print(f"平均组大小: {avg_gs:.2f}")
     print(f"组大小分布: min={min(group_sizes) if group_sizes else 0}, "
           f"max={max(group_sizes) if group_sizes else 0}, "
           f"median={np.median(group_sizes) if group_sizes else 0:.1f}")
-    
     if ari is not None:
         print(f"\nAdjusted Rand Index: {ari:.4f}")
         print(f"Normalized Mutual Info: {nmi:.4f}")
-    
+
     return {
-        'coverage': coverage,
-        'zero_sum_accuracy': zero_sum_accuracy,
-        'avg_deviation': avg_deviation,
-        'num_groups': len(predicted_groups),
-        'avg_group_size': avg_group_size,
-        'ari': ari,
-        'nmi': nmi
+        'coverage': coverage, 'zero_sum_accuracy': zsa, 'avg_deviation': avg_dev,
+        'num_groups': len(predicted_groups), 'avg_group_size': avg_gs, 'ari': ari, 'nmi': nmi
     }
 
-# ========== 6. 主流程 ==========
+
+# ========== 8. 主流程 ==========
 def main(data_path='clearing_data.csv', max_test_groups=None, model_path='model.pt'):
-    """
-    主流程
-    max_test_groups: 限制测试集组数用于快速验证（None=全部）
-    """
     print("=" * 70)
-    print("自动清账系统 - 深度学习方案")
+    print("自动清账系统 - Entity Embedding + 对比学习")
     print("=" * 70)
-    
+
     print("\n加载数据...")
     df = pd.read_csv(data_path)
-    
     print(f"数据形状: {df.shape}")
     print(f"唯一组数: {df['Group ID'].nunique()}")
     print(f"平均每组样本数: {len(df) / df['Group ID'].nunique():.2f}")
-    
+
     print("\n划分训练集和测试集...")
     unique_groups = df['Group ID'].unique()
-    train_groups_full, test_groups_full = train_test_split(
-        unique_groups, test_size=0.2, random_state=42
-    )
-    
+    train_groups_full, test_groups_full = train_test_split(unique_groups, test_size=0.2, random_state=42)
+
     if max_test_groups is not None and max_test_groups < len(test_groups_full):
         test_groups = np.random.RandomState(42).choice(test_groups_full, max_test_groups, replace=False)
     else:
         test_groups = test_groups_full
-    
+
     df_data = df[df['Group ID'].isin(train_groups_full)].reset_index(drop=True)
     df_test = df[df['Group ID'].isin(test_groups)].reset_index(drop=True)
-    
+
     print(f"训练数据: {len(df_data)} 行, {len(train_groups_full)} 组")
     print(f"测试集: {len(df_test)} 行, {len(test_groups)} 组")
-    
-    # 训练（或加载已有模型）
+
     import os
+    need_retrain = False
     if os.path.exists(model_path):
-        print(f"\n发现已有模型 {model_path}，加载中...")
-        preprocessor = ClearingDataPreprocessor()
-        model, preprocessor = load_model(None, preprocessor, model_path)
+        tmp = torch.load(model_path, map_location='cpu', weights_only=False)
+        if tmp.get('arch_version') != 3:
+            print(f"\n检测到旧版模型 {model_path}，将重新训练...")
+            need_retrain = True
+        else:
+            print(f"\n发现已有模型 {model_path}，加载中...")
+            model, preprocessor = load_model(model_path)
     else:
+        need_retrain = True
+
+    if need_retrain:
         print("\n开始训练...")
-        model, preprocessor = train_compatibility_model(
-            df_data, epochs=50, batch_size=128, lr=0.001, patience=10
-        )
+        model, preprocessor = train_encoder_model(df_data, epochs=50, batch_group_size=10, patience=15)
         save_model(model, preprocessor, model_path)
-    
-    # 在测试集上预测
+
     df_test_no_label = df_test.drop('Group ID', axis=1)
-    
+
     predicted_groups = find_clearing_groups(
         model, preprocessor, df_test_no_label,
-        compatibility_threshold=0.6,
-        max_group_size=10
+        max_group_size=10, dbscan_eps=0.3
     )
-    
-    # 评估
+
     metrics = evaluate_clearing_results(df_test, predicted_groups)
-    
-    # 展示示例
+
     print("\n" + "=" * 70)
     print("示例清账组（前 5 个）")
     print("=" * 70)
-    
     for i, group in enumerate(predicted_groups[:5]):
         print(f"\n{'='*70}")
         print(f"组 {i+1} (共 {len(group)} 条凭证)")
         print(f"{'='*70}")
-        
-        group_df = df_test.iloc[group][[
-            'Account', 'Company Code', 'Profit Center', 
-            'Supplier', 'Text', 'Amount in doc. curr.'
-        ]]
-        
+        group_df = df_test.iloc[group][['Account', 'Company Code', 'Profit Center', 'Supplier', 'Text', 'Amount in doc. curr.']]
         print(group_df.to_string(index=False))
         print(f"\n总金额: {group_df['Amount in doc. curr.'].sum():.4f}")
-        
         if 'Group ID' in df_test.columns:
             true_groups = df_test.iloc[group]['Group ID'].unique()
             print(f"真实 Group ID: {true_groups}")
-    
-    # 保存结果
+
     print("\n" + "=" * 70)
     print("保存结果...")
-    
     df_test['Predicted_Group'] = -1
     for i, group in enumerate(predicted_groups):
         for idx in group:
             df_test.at[idx, 'Predicted_Group'] = i
-    
     df_test.to_csv('clearing_results.csv', index=False)
     print("结果已保存到 clearing_results.csv")
-    
+
     return model, preprocessor, predicted_groups, metrics
 
-# ========== 运行 ==========
+
 if __name__ == "__main__":
     model, preprocessor, predicted_groups, metrics = main(
         'clearing_data.csv',
-        max_test_groups=50  # 先用少量测试集快速验证，设为 None 跑全部
+        max_test_groups=50
     )
